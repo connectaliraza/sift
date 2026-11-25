@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
-| **Owner** | _Ali Raza_ |
+| **Status** | Draft v0.2 |
+| **Owner** | _your name_ |
 | **Last updated** | 2026-11-25 |
 | **Related** | [PRD](./PRD.md) · [ADRs](./adr/) |
 
@@ -11,7 +11,7 @@
 
 ## 1. Overview
 
-Sift is an asynchronous document-processing service. A **FastAPI** application accepts uploads and serves results; **Celery** workers run OCR, LLM extraction and validation; **PostgreSQL** stores state; **Redis** is the Celery broker; **MinIO** stores files; **Ollama** serves a local LLM. Everything runs under **Docker Compose**.
+Sift is an asynchronous document-processing service. A **FastAPI** application accepts uploads and serves results; **Celery** workers run OCR, LLM extraction and validation; **PostgreSQL** stores state; **Redis** is the Celery broker; **RustFS** stores files; **Ollama** serves a local LLM. Everything except Ollama runs under **Docker Compose**; Ollama runs natively on the host (see §16).
 
 Design principles:
 1. **Correct under failure** – every task is idempotent; crashes and retries never corrupt state or duplicate side effects.
@@ -31,14 +31,14 @@ flowchart LR
         API[FastAPI<br/>api]
         R[(Redis<br/>broker)]
         PG[(PostgreSQL)]
-        S3[(MinIO<br/>S3 storage)]
+        S3[(RustFS<br/>S3 storage)]
         WO[Celery worker<br/>queue: ocr]
         WL[Celery worker<br/>queue: llm]
         WD[Celery worker<br/>queue: default]
         BEAT[Celery beat]
-        OL[Ollama<br/>local LLM]
         FL[Flower]
     end
+    OL[Ollama<br/>native on host]
     Hook([Client webhook endpoint])
 
     Client -- REST --> API
@@ -65,8 +65,8 @@ flowchart LR
 | `beat` | Periodic outbox dispatch and stuck-job sweeper. **Exactly one instance.** | — |
 | `postgres` | Source of truth for jobs, results, outbox. | — |
 | `redis` | Celery broker + result backend (results unused; state lives in Postgres). | — |
-| `minio` | Original files. | — |
-| `ollama` | Local LLM inference. | — |
+| `objectstore` | Original files (RustFS, S3-compatible). | — |
+| `ollama` | Local LLM inference. Runs natively on the host, outside Compose (§16). | — |
 | `flower` | Celery monitoring UI (dev/ops). | — |
 
 ### 2.2 Why separate queues
@@ -83,9 +83,9 @@ OCR is CPU-heavy and slow; LLM calls are long-waiting I/O. On one queue, a burst
 | API | FastAPI + Pydantic v2 | — | |
 | DB access | SQLAlchemy 2.0 (async in API, sync in workers) + Alembic | Managed Postgres | Shared model definitions. |
 | Queue | Celery 5 + Redis | Managed Redis / RabbitMQ | |
-| Storage | MinIO (`boto3`) | AWS S3 | Same S3 API, endpoint via config. |
+| Storage | RustFS (`boto3`) | AWS S3 | Same S3 API, endpoint via config. MinIO CE images were withdrawn in 2025 (ADR 0002). |
 | OCR | Tesseract (`pytesseract`) + `pdf2image`; Docling optional | Textract / Azure DI | Behind `OcrEngine` port. |
-| LLM | Ollama, 7–8B instruct model, via LiteLLM | OpenAI / Anthropic / etc. | Behind `Extractor` port; model is a config string. |
+| LLM | Ollama (native on host), 3B instruct model by default (e.g. `qwen2.5:3b`), via LiteLLM | OpenAI / Anthropic / etc. | Behind `Extractor` port; model is a config string. |
 | Config | `pydantic-settings` | Secret manager | 12-factor, env vars only. |
 | Logging | `structlog` (JSON) | Datadog / Grafana Cloud | |
 | Monitoring | Flower | Prometheus + Grafana | |
@@ -187,13 +187,14 @@ class LineItem(BaseModel):
     unit_price: Decimal | None
     amount: Decimal
 
+
 class Invoice(BaseModel):
     vendor_name: str
     vendor_tax_id: str | None
     invoice_number: str
     invoice_date: date
     due_date: date | None
-    currency: str            # ISO 4217
+    currency: str  # ISO 4217
     subtotal: Decimal | None
     tax_amount: Decimal | None
     total_amount: Decimal
@@ -243,7 +244,7 @@ Base path `/v1`. Auth via `X-API-Key` (compared with `secrets.compare_digest`). 
 | `PATCH /v1/documents/{id}/review` | Body: full corrected `Invoice`. Allowed only in `needs_review`. Creates `human` extraction, moves to `completed`. | `200` |
 | `POST /v1/documents/{id}/retry` | Allowed only in `failed`. | `202` |
 | `GET /health` | Process alive. | `200` |
-| `GET /ready` | DB, Redis, MinIO reachable. | `200` / `503` |
+| `GET /ready` | DB, Redis, RustFS reachable. | `200` / `503` |
 
 **Idempotency behaviour**
 - Same key + same file hash → return the original `202` response.
@@ -280,7 +281,7 @@ sequenceDiagram
     participant C as Client
     participant A as API
     participant DB as Postgres
-    participant S as MinIO
+    participant S as RustFS
     participant Q as Redis
     participant W as Workers
     participant L as Ollama
@@ -302,7 +303,7 @@ sequenceDiagram
     W->>C: signed webhook POST
 ```
 
-The chain is `ocr_document.s(id) | extract_invoice.s() | finalize_document.s()`. Tasks receive **only the document ID** and load everything else from Postgres/MinIO.
+The chain is `ocr_document.s(id) | extract_invoice.s() | finalize_document.s()`. Tasks receive **only the document ID** and load everything else from Postgres/RustFS.
 
 The API enqueues **after the DB transaction commits**. If enqueueing fails, the document stays in `received`; the stuck-job sweeper (§8.4) re-enqueues it.
 
@@ -400,7 +401,7 @@ Receivers should reject timestamps older than 5 minutes (replay protection). The
 | Redis restarts, queued messages lost | Sweeper | Re-enqueued from Postgres state (Postgres is the source of truth). |
 | Webhook endpoint down | Non-2xx / timeout | Backoff schedule → `dead`; visible in DB, can be re-queued. |
 | Client retries upload | `Idempotency-Key` | Original response returned. |
-| MinIO unavailable on upload | Exception | `503` with Problem Details; no DB row is created. |
+| Object storage unavailable on upload | `TransientError` | `503` with Problem Details; no DB row is created. |
 
 ---
 
@@ -416,7 +417,7 @@ Receivers should reject timestamps older than 5 minutes (replay protection). The
 ## 12. Security
 
 - Containers run as a non-root user; multi-stage images contain no build tools.
-- Secrets (`API_KEY`, `WEBHOOK_SIGNING_SECRET`, DB/MinIO creds) only via env; `.env.example` contains placeholders.
+- Secrets (`API_KEY`, `WEBHOOK_SIGNING_SECRET`, DB/RustFS creds) only via env; `.env.example` contains placeholders.
 - File type determined from content, size limit enforced while streaming, PDF page cap (zip-bomb style protection).
 - In the default config, no document data leaves the host (local OCR and LLM).
 - Dependabot + `pip-audit` in CI.
@@ -430,10 +431,10 @@ Receivers should reject timestamps older than 5 minutes (replay protection). The
 |---|---|---|
 | `DATABASE_URL` | compose Postgres | |
 | `REDIS_URL` | compose Redis | |
-| `S3_ENDPOINT_URL` / `S3_BUCKET` / keys | MinIO | Unset endpoint → real AWS S3. |
+| `S3_ENDPOINT_URL` / `S3_BUCKET` / keys | RustFS | Unset endpoint → real AWS S3. |
 | `OCR_ENGINE` | `tesseract` | `docling` \| `textract` (future) |
 | `LLM_MODEL` | `ollama/<model>` | Any LiteLLM model string, e.g. a paid provider later. |
-| `LLM_API_BASE` | `http://ollama:11434` | |
+| `LLM_API_BASE` | `http://host.docker.internal:11434` | Ollama on the host. |
 | `LLM_TIMEOUT_S` | 180 | |
 | `REVIEW_THRESHOLD` | 0.80 | |
 | `MAX_UPLOAD_MB` / `MAX_PAGES` | 10 / 10 | |
@@ -451,7 +452,7 @@ The app fails fast on startup if required settings are missing.
 |---|---|---|
 | Unit | pytest | Validation rules, confidence scoring, state transitions, services with fake adapters. No I/O; runs in seconds. |
 | Adapter | pytest + respx | LiteLLM/webhook HTTP behaviour, error mapping to Transient/Permanent. |
-| Integration | testcontainers (Postgres, Redis, MinIO) | API endpoints, idempotency, CAS updates, outbox dispatch with `SKIP LOCKED`, Celery tasks run eagerly against real DB. |
+| Integration | testcontainers (Postgres, Redis, RustFS) | API endpoints, idempotency, CAS updates, outbox dispatch with `SKIP LOCKED`, Celery tasks run eagerly against real DB. |
 | End-to-end | `docker compose` + script | Upload sample invoice → poll → assert `completed`. Run manually and in a nightly CI job. |
 | Evaluation | `evals/run_eval.py` | Field-level accuracy, auto-complete rate, false-confidence rate. Writes `evals/report.json` + markdown summary. |
 
@@ -476,9 +477,22 @@ The app fails fast on startup if required settings are missing.
 - One multi-stage `Dockerfile` (builder with `uv`, slim runtime) used by `api`, workers and beat with different commands; OCR system packages (`tesseract-ocr`, `poppler-utils`) included in the runtime image.
 - Healthchecks on every service; `depends_on: condition: service_healthy`.
 - A one-shot `migrate` service runs `alembic upgrade head` before `api` and workers start.
-- An `ollama-init` one-shot service pulls the configured model on first start.
-- Named volumes for Postgres, MinIO and Ollama models.
-- `docker compose up` → API at `:8000/docs`, Flower at `:5555`, MinIO console at `:9001`.
+- A one-shot `storage-init` service (same app image) creates the bucket, retrying until storage is up.
+- Named volumes for Postgres and RustFS.
+- **Ollama runs natively on the host, not in Compose.** On macOS, Docker cannot use the Apple GPU, so native Ollama is several times faster. Containers reach it at `http://host.docker.internal:11434`.
+
+### 16.1 Compose profiles (8 GB RAM target)
+
+| Profile | Services | Use |
+|---|---|---|
+| `lean` (default, set in `.env`) | postgres, redis, objectstore, api, **one** worker consuming `ocr,llm,default` with concurrency 2 | Laptops with 8 GB RAM. |
+| `full` | postgres, redis, objectstore, api, `worker-ocr`, `worker-llm`, `worker-default`, flower | Matches §2 architecture; 16 GB+ or a server. |
+
+Switch with `COMPOSE_PROFILES=full docker compose up`. Queue routing is identical in both profiles; only the worker topology changes, so code behaves the same.
+
+Memory limits are set on every container. Postgres and Redis run with small-footprint settings. Redis uses `noeviction` + AOF, because evicting broker keys would silently drop jobs.
+
+`beat` is added in week 3 together with the outbox and sweeper.
 
 ---
 
@@ -499,7 +513,7 @@ The app fails fast on startup if required settings are missing.
 | # | Decision |
 |---|---|
 | 001 | Celery + Redis for background processing (vs Arq / Dramatiq / FastAPI BackgroundTasks) |
-| 002 | Ports-and-adapters for OCR/LLM/storage to enable free → paid swaps |
+| 002 | Ports-and-adapters for OCR/LLM/storage; RustFS replaces MinIO for local S3 |
 | 003 | Postgres as source of truth; transactional outbox for webhooks |
 | 004 | Computed (grounded) confidence instead of LLM self-reported confidence |
 | 005 | Default OCR engine (Tesseract vs Docling), decided by eval results |

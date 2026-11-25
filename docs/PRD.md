@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
-| **Owner** | _Ali Raza_ |
+| **Status** | Draft v0.2 |
+| **Owner** | _your name_ |
 | **Last updated** | 2026-11-25 |
 | **Related** | [TRD](./TRD.md) · [ADRs](./adr/) |
 
@@ -89,8 +89,8 @@ One command (`docker compose up`) gives a working system.
 | Area | Requirement |
 |---|---|
 | **Reliability** | No job is lost if a worker crashes mid-task; every task is safe to run twice. |
-| **Performance** | p95 end-to-end ≤ 90 s for a 2-page invoice on a 4-core CPU laptop with a local 7–8B model. Upload response ≤ 300 ms. |
-| **Portability** | Runs with `docker compose up` on Linux/macOS/Windows (WSL2) with 16 GB RAM. No GPU required. |
+| **Performance** | p95 end-to-end ≤ 90 s for a 2-page invoice on an 8 GB Apple Silicon (M2) laptop with a local 3B model. Upload response ≤ 300 ms. |
+| **Portability** | Runs with `docker compose up` on Linux/macOS/Windows (WSL2) with 8 GB RAM (lean profile). No GPU required; Apple Silicon GPU used when Ollama runs natively. |
 | **Cost** | $0 to run in default configuration. |
 | **Observability** | Every log line is structured JSON with a correlation ID traceable from API request to the final task. |
 | **Security** | Non-root containers, secrets only via environment variables, signed webhooks, no documents leave the host in default config. |

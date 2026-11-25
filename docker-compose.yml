@@ -1,0 +1,163 @@
+# Sift local stack.
+#
+#   cp .env.example .env
+#   docker compose up --build          # lean profile (8 GB RAM laptops), set in .env
+#   COMPOSE_PROFILES=full docker compose up --build   # separate workers + Flower
+#
+# Ollama is NOT here: run it natively on the host (GPU on Apple Silicon).
+# Containers reach it at http://host.docker.internal:11434.
+
+name: sift
+
+# Shared settings for every service that runs the app image.
+# Only `api` has a `build:` section: if several services build the same tag in
+# parallel, BuildKit races on the export ("image sift:dev already exists").
+x-app: &app
+  image: sift:dev
+  pull_policy: never      # local image only; never look for it on Docker Hub
+  env_file: .env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"   # Linux; built in on Docker Desktop/OrbStack
+  restart: unless-stopped
+  depends_on: &app-deps
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    storage-init: { condition: service_completed_successfully }
+    migrate: { condition: service_completed_successfully }
+
+x-worker-healthcheck: &worker-healthcheck
+  test: ["CMD-SHELL", "celery -A sift.workers.celery_app inspect ping -d $${WORKER_NODE}@$$HOSTNAME --timeout 5 || exit 1"]
+  interval: 60s
+  timeout: 15s
+  retries: 3
+  start_period: 30s
+
+services:
+  # ------------------------------------------------------------ infrastructure
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Small-footprint settings for laptops.
+    command: >
+      postgres -c shared_buffers=64MB -c work_mem=4MB -c max_connections=40
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy: { resources: { limits: { memory: 256m } } }
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Broker durability: AOF on, and NEVER evict keys (eviction silently drops jobs).
+    command: >
+      redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy noeviction
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy: { resources: { limits: { memory: 96m } } }
+    restart: unless-stopped
+
+  # S3-compatible storage. MinIO's community images were withdrawn in Oct 2025,
+  # so local dev uses RustFS (Apache-2.0). The app only speaks the S3 API, so
+  # production can point at AWS S3 with no code change (see docs/adr/0002).
+  objectstore:
+    image: rustfs/rustfs:latest   # TODO: pin a tested tag
+    command: ["--address", ":9000", "--console-enable", "/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+    ports: ["127.0.0.1:${S3_PORT:-9000}:9000", "127.0.0.1:${S3_CONSOLE_PORT:-9001}:9001"]
+    volumes: [objectdata:/data]
+    deploy: { resources: { limits: { memory: 256m } } }
+    restart: unless-stopped
+
+  # Creates the bucket; retries until storage accepts connections.
+  storage-init:
+    <<: *app
+    command: ["python", "-m", "sift.scripts.ensure_bucket"]
+    depends_on:
+      objectstore: { condition: service_started }
+    restart: "no"
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # ------------------------------------------------------------ application
+  api:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy: { resources: { limits: { memory: 384m } } }
+
+  # Lean profile: one worker consuming every queue. Same routing, fewer processes.
+  worker:
+    <<: *app
+    profiles: ["lean"]
+    command: >
+      celery -A sift.workers.celery_app worker -Q ocr,llm,default
+      --concurrency 2 -n worker@%h --loglevel INFO -E
+    environment: { WORKER_NODE: worker }
+    healthcheck: *worker-healthcheck
+    deploy: { resources: { limits: { memory: 768m } } }
+
+  # Full profile: one pool per workload (TRD §2.2).
+  worker-ocr:
+    <<: *app
+    profiles: ["full"]
+    command: celery -A sift.workers.celery_app worker -Q ocr --concurrency 2 -n ocr@%h --loglevel INFO -E
+    environment: { WORKER_NODE: ocr }
+    healthcheck: *worker-healthcheck
+    deploy: { resources: { limits: { memory: 768m } } }
+
+  worker-llm:
+    <<: *app
+    profiles: ["full"]
+    command: celery -A sift.workers.celery_app worker -Q llm --concurrency 2 -n llm@%h --loglevel INFO -E
+    environment: { WORKER_NODE: llm }
+    healthcheck: *worker-healthcheck
+    deploy: { resources: { limits: { memory: 384m } } }
+
+  worker-default:
+    <<: *app
+    profiles: ["full"]
+    command: celery -A sift.workers.celery_app worker -Q default --concurrency 2 -n default@%h --loglevel INFO -E
+    environment: { WORKER_NODE: default }
+    healthcheck: *worker-healthcheck
+    deploy: { resources: { limits: { memory: 384m } } }
+
+  flower:
+    <<: *app
+    profiles: ["full"]
+    command: celery -A sift.workers.celery_app flower --port=5555
+    ports: ["127.0.0.1:5555:5555"]
+    deploy: { resources: { limits: { memory: 256m } } }
+
+volumes:
+  pgdata:
+  redisdata:
+  objectdata:
