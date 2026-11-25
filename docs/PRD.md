@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft v0.2 |
-| **Owner** | _your name_ |
+| **Owner** | _Ali Raza_ |
 | **Last updated** | 2026-11-25 |
 | **Related** | [TRD](./TRD.md) · [ADRs](./adr/) |
 
